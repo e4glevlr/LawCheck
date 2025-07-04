@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+*.venv/
+env/
+ENV/
+
+# Database
+chroma_db_phapluat/
+
+# Secrets
+.env
+
+# IDE files
+.idea/
+.vscode/
