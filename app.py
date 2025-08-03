@@ -1,157 +1,127 @@
 # app.py
-
 import os
-from dotenv import load_dotenv
-
-# LangChain Components
-from langchain_community.document_loaders import PyPDFLoader, DirectoryLoader
+import boto3
+from langchain_community.document_loaders import DirectoryLoader, UnstructuredWordDocumentLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_community.vectorstores import Chroma
-from langchain.prompts import PromptTemplate
-from langchain.schema.runnable import RunnablePassthrough
-from langchain.schema.output_parser import StrOutputParser
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import OpenSearchVectorSearch
+from opensearchpy import RequestsHttpConnection
+from requests_aws4auth import AWS4Auth
 
-# Tải các biến môi trường từ file .env (chứa OPENAI_API_KEY)
-load_dotenv()
+# --- PHẦN CẤU HÌNH ---
+# Người dùng cần điền các thông tin này
 
-# --- CÁC HẰNG SỐ CẤU HÌNH ---
+# 1. Đường dẫn đến thư mục chứa các file văn bản đã tải về (.doc, .docx, .pdf, .txt)
 DATA_PATH = "data/"
-CHROMA_PATH = "chroma_db_phapluat"
-OPENAI_EMBEDDING_MODEL = "text-embedding-3-small"
-OPENAI_LLM_MODEL = "gpt-4o"
+
+# 2. Tên của mô hình embedding trên Hugging Face Hub
+EMBEDDING_MODEL_NAME = "huyydangg/DEk21_hcmute_embedding"
+
+# 3. Thông tin kết nối đến Amazon OpenSearch Serverless
+#    Bạn có thể tìm thấy URL này trong trang quản lý Collection trên AWS Console.
+OPENSEARCH_URL = "https://12g32kt3h1787gxv7t14.eu-north-1.aoss.amazonaws.com"
+
+# 4. Tên của chỉ mục (index) bạn muốn tạo trong OpenSearch để lưu trữ dữ liệu
+INDEX_NAME = "lawcheck"
+
+# 5. Region của AWS nơi bạn tạo OpenSearch Collection
+AWS_REGION = "eu-north-1"  # Ví dụ: "ap-southeast-1"
 
 
-def create_vector_db():
-    """
-    Hàm này thực hiện quá trình Indexing:
-    1. Tải các tài liệu PDF từ thư mục DATA_PATH.
-    2. Chia nhỏ các tài liệu thành các chunks.
-    3. Tạo embeddings cho từng chunk.
-    4. Lưu trữ các chunks và embeddings vào ChromaDB.
+def get_aws_credentials():
+    session = boto3.Session()
+    credentials = session.get_credentials()
+    return AWS4Auth(
+        credentials.access_key,
+        credentials.secret_key,
+        AWS_REGION,
+        'aoss',
+        session_token=credentials.token
+    )
 
-    Hàm này chỉ cần chạy MỘT LẦN hoặc khi có văn bản pháp luật mới.
-    """
-    print("Bắt đầu quá trình chỉ mục hóa dữ liệu...")
 
-    # 1. Tải tài liệu
-    # Tải tất cả các file PDF trong thư mục và các thư mục con của nó
-    loader = DirectoryLoader(DATA_PATH, glob="**/*.pdf", loader_cls=PyPDFLoader, show_progress=True)
-    documents = loader.load()
+def index_documents_to_opensearch():
+    print("--- BẮT ĐẦU QUY TRÌNH CHỈ MỤC HÓA DỮ LIỆU ---")
 
-    if not documents:
-        print(f"Lỗi: Không tìm thấy file PDF nào trong thư mục '{DATA_PATH}'.")
-        print("Vui lòng thêm ít nhất một file PDF vào thư mục 'data' và thử lại.")
+    print(f"\n[BƯỚC 1/4] Đang tải tài liệu từ thư mục: '{DATA_PATH}'...")
+
+    loader = DirectoryLoader(
+        DATA_PATH,
+        glob="**/*.doc",
+        loader_cls=UnstructuredWordDocumentLoader,
+        show_progress=True,
+        use_multithreading=True
+    )
+
+    try:
+        documents = loader.load()
+        if not documents:
+            print(f"Lỗi: Không tìm thấy hoặc không thể tải bất kỳ file .doc nào trong '{DATA_PATH}'.")
+            print("Vui lòng kiểm tra lại đường dẫn và định dạng file.")
+            return
+        print(f"-> Đã tải thành công {len(documents)} tài liệu.")
+    except Exception as e:
+        print(f"Lỗi nghiêm trọng khi tải tài liệu: {e}")
+        print(
+            "Gợi ý: Hãy chắc chắn bạn đã cài đặt các thư viện trong `requirements.txt` mới, đặc biệt là `unstructured`.")
         return
 
-    print(f"Đã tải thành công {len(documents)} trang từ các file PDF.")
-
-    # 2. Chia nhỏ văn bản thành các chunks
+    # --- BƯỚC 2: CHIA NHỎ VĂN BẢN (SPLITTING) ---
+    print(f"\n[BƯỚC 2/4] Đang chia nhỏ các tài liệu thành các đoạn văn bản (chunks)...")
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,  # Kích thước mỗi chunk (tính bằng ký tự)
-        chunk_overlap=200  # Số ký tự chồng lấp để đảm bảo tính liên tục
+        chunk_size=1000,
+        chunk_overlap=200,
+        length_function=len,
     )
     chunks = text_splitter.split_documents(documents)
-    print(f"Đã chia tài liệu thành {len(chunks)} chunks nhỏ.")
+    print(f"-> Đã chia {len(documents)} tài liệu thành {len(chunks)} chunks.")
 
-    # 3. Tạo embeddings và lưu trữ vào ChromaDB
-    print("Đang tạo embeddings và lưu vào ChromaDB (quá trình này có thể mất vài phút)...")
-    embeddings = OpenAIEmbeddings(model=OPENAI_EMBEDDING_MODEL)
+    # --- BƯỚC 3: KHỞI TẠO MÔ HÌNH EMBEDDING ---
+    print(f"\n[BƯỚC 3/4] Đang tải mô hình embedding: '{EMBEDDING_MODEL_NAME}'...")
+    print("(Quá trình này có thể mất vài phút cho lần chạy đầu tiên)")
 
-    # Tạo và lưu DB vào thư mục CHROMA_PATH
-    db = Chroma.from_documents(
-        documents=chunks,
-        embedding=embeddings,
-        persist_directory=CHROMA_PATH
+    embeddings = HuggingFaceEmbeddings(
+        model_name=EMBEDDING_MODEL_NAME,
+        model_kwargs={'device': 'cpu'}
     )
+    print("-> Tải mô hình embedding thành công.")
 
-    print(f"Đã lưu thành công {db._collection.count()} chunks vào '{CHROMA_PATH}'.")
-    print("--- QUÁ TRÌNH CHỈ MỤC HÓA HOÀN TẤT ---")
+    # --- BƯỚC 4: TẢI DỮ LIỆU LÊN AMAZON OPENSEARCH ---
+    print(f"\n[BƯỚC 4/4] Đang tạo embeddings và tải lên OpenSearch index: '{INDEX_NAME}'...")
 
+    try:
+        if "your-opensearch-endpoint" in OPENSEARCH_URL or "your-aws-region" in AWS_REGION:
+            print("\n!!! LỖI CẤU HÌNH !!!")
+            print("Vui lòng cập nhật các biến OPENSEARCH_URL và AWS_REGION trong file app.py.")
+            return
 
-def get_rag_chain():
-    """
-    Hàm này tạo ra một chuỗi RAG (Retrieval-Augmented Generation) để xử lý truy vấn.
-    Nó sẽ kết nối VectorDB (Retriever) với mô hình ngôn ngữ (LLM).
-    """
-    # Khởi tạo mô hình embedding (cần thiết để tải DB)
-    embeddings = OpenAIEmbeddings(model=OPENAI_EMBEDDING_MODEL)
+        aws_auth = get_aws_credentials()
 
-    # Tải VectorDB đã được lưu từ trước
-    vector_db = Chroma(persist_directory=CHROMA_PATH, embedding_function=embeddings)
+        docsearch = OpenSearchVectorSearch.from_documents(
+            documents=chunks,
+            embedding=embeddings,
+            opensearch_url=OPENSEARCH_URL,
+            http_auth=aws_auth,  # Sử dụng xác thực IAM
+            use_ssl=True,
+            verify_certs=True,
+            connection_class=RequestsHttpConnection,
+            index_name=INDEX_NAME,
+            engine="faiss",
+        )
+        print("\n--- HOÀN TẤT ---")
+        print(f"-> Đã chỉ mục hóa thành công {len(chunks)} chunks vào OpenSearch.")
+        print(f"-> Tên Index: {INDEX_NAME}")
+        print(f"-> Endpoint: {OPENSEARCH_URL}")
 
-    # 1. Tạo Retriever từ VectorDB
-    # Retriever có nhiệm vụ tìm kiếm các chunks văn bản liên quan trong DB
-    retriever = vector_db.as_retriever(
-        search_type="similarity",  # Các loại khác: "mmr", "similarity_score_threshold"
-        search_kwargs={"k": 5}  # Lấy về 5 chunks liên quan nhất cho mỗi truy vấn
-    )
-
-    # 2. Tạo Prompt Template
-    # Đây là "linh hồn" của hệ thống RAG, hướng dẫn LLM cách trả lời.
-    PROMPT_TEMPLATE = """
-Bạn là một trợ lý AI chuyên về pháp luật Việt Nam. Nhiệm vụ của bạn là trả lời câu hỏi của người dùng một cách chính xác và khách quan.
-Hãy trả lời câu hỏi của người dùng DỰA VÀO VÀ CHỈ DỰA VÀO phần ngữ cảnh được cung cấp dưới đây.
-
-NGỮ CẢNH:
-{context}
-
-CÂU HỎI:
-{question}
-
-HƯỚNG DẪN:
-- Nếu ngữ cảnh không chứa thông tin để trả lời câu hỏi, hãy nói rõ ràng: "Dựa trên các văn bản được cung cấp, tôi không tìm thấy thông tin để trả lời cho câu hỏi này."
-- Đưa ra câu trả lời trực tiếp, rõ ràng và súc tích.
-- Trích dẫn các điều, khoản liên quan nếu có trong ngữ cảnh.
-- Luôn trả lời bằng tiếng Việt.
-
-CÂU TRẢ LỜI CỦA BẠN:
-"""
-    prompt = PromptTemplate.from_template(PROMPT_TEMPLATE)
-
-    # 3. Khởi tạo mô hình LLM
-    # Sử dụng temperature thấp (0.1) để câu trả lời bám sát sự thật, ít sáng tạo
-    llm = ChatOpenAI(model_name=OPENAI_LLM_MODEL, temperature=0.1)
-
-    # 4. Tạo chuỗi RAG bằng LangChain Expression Language (LCEL)
-    rag_chain = (
-            {"context": retriever, "question": RunnablePassthrough()}
-            | prompt
-            | llm
-            | StrOutputParser()
-    )
-
-    return rag_chain
+    except Exception as e:
+        print(f"\n!!! LỖI KHI KẾT NỐI HOẶC TẢI DỮ LIỆU LÊN OPENSEARCH !!!")
+        print(f"Lỗi chi tiết: {e}")
+        print("\n**Gợi ý khắc phục:**")
+        print("1. Kiểm tra lại thông tin OPENSEARCH_URL và AWS_REGION có chính xác không.")
+        print(
+            "2. Đảm bảo máy của bạn đã được cấu hình AWS credentials đúng cách (chạy `aws configure` với IAM User đã được cấp quyền trong Data Access Policy).")
+        print("3. Kiểm tra cấu hình Network của OpenSearch Collection, đảm bảo nó cho phép truy cập từ IP của bạn.")
 
 
-# --- ĐIỂM BẮT ĐẦU CỦA CHƯƠNG TRÌNH ---
 if __name__ == '__main__':
-    # KIỂM TRA API KEY
-    if not os.getenv("OPENAI_API_KEY"):
-        print("Lỗi: Không tìm thấy OPENAI_API_KEY. Vui lòng tạo file .env và thêm key của bạn vào.")
-    else:
-        # --- CHỨC NĂNG 1: CHỈ MỤC HÓA DỮ LIỆU ---
-        # Bỏ comment dòng dưới đây để chạy lần đầu hoặc khi có dữ liệu mới.
-        # Sau khi chạy xong, hãy comment lại để không phải chạy lại mỗi lần truy vấn.
-
-        # create_vector_db()
-
-        # --- CHỨC NĂNG 2: TRUY VẤN VÀ HỎI ĐÁP ---
-        # Đảm bảo bạn đã chạy create_vector_db() ít nhất một lần.
-        if not os.path.exists(CHROMA_PATH):
-            print(f"Lỗi: Không tìm thấy cơ sở dữ liệu tại '{CHROMA_PATH}'.")
-            print("Vui lòng chạy hàm 'create_vector_db()' trước tiên (bỏ comment dòng đó trong code).")
-        else:
-            rag_chain = get_rag_chain()
-
-            print("\nHệ thống hỏi đáp pháp luật đã sẵn sàng. Nhập 'exit' để thoát.")
-            while True:
-                question = input("\n[BẠN HỎI]: ")
-                if question.lower() == 'exit':
-                    break
-                if not question.strip():
-                    continue
-
-                print("\n[AI ĐANG TRẢ LỜI]...")
-                response = rag_chain.invoke(question)
-                print(response)
+    index_documents_to_opensearch()
