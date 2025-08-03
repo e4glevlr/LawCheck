@@ -6,8 +6,8 @@
 
 1.  **Clone repository (hoặc tạo các file từ script):**
     ```bash
-    git clone <your-repo-url>
-    cd <repo-folder>
+    git clone https://github.com/e4glevlr/LawCheck.git
+    cd LawCheck
     ```
 
 2.  **Tạo môi trường ảo (khuyến khích):**
